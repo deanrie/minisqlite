@@ -18,8 +18,9 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 use minisqlite_expr::{to_integer, FnContext, ScalarFunction};
-use minisqlite_types::{integer_to_text, real_to_text, Error, Result, Value};
+use minisqlite_types::{integer_to_text, real_to_text, Error, Result, TextEncoding, Value};
 
+use super::blobs_as_text;
 use crate::registry::{Arity, FunctionRegistry};
 
 /// `randomblob`/`zeroblob` refuse a request past this many bytes with SQLite's
@@ -233,9 +234,17 @@ impl ScalarFunction for Quote {
 #[derive(Debug)]
 struct Hex;
 impl ScalarFunction for Hex {
-    fn call(&self, args: &[Value], _ctx: &mut dyn FnContext) -> Result<Value> {
+    fn call(&self, args: &[Value], ctx: &mut dyn FnContext) -> Result<Value> {
         debug_assert!(args.len() == 1, "hex/1 arity precondition");
-        Ok(Value::Text(to_upper_hex(&value_text_bytes(&args[0]))))
+        let enc = ctx.text_encoding();
+        let bytes = match &args[0] {
+            // `hex` reads its argument as a BLOB, so TEXT contributes its bytes in the
+            // database encoding (lang_expr.html "CAST expressions"). A number keeps its
+            // UTF-8 rendering, as in sqlite: `hex(12)` is `3132` on every database.
+            Value::Text(s) if enc != TextEncoding::Utf8 => Cow::Owned(enc.encode_text(s)),
+            v => value_text_bytes(v),
+        };
+        Ok(Value::Text(to_upper_hex(&bytes)))
     }
 }
 
@@ -245,8 +254,9 @@ impl ScalarFunction for Hex {
 #[derive(Debug)]
 struct Unhex;
 impl ScalarFunction for Unhex {
-    fn call(&self, args: &[Value], _ctx: &mut dyn FnContext) -> Result<Value> {
+    fn call(&self, args: &[Value], ctx: &mut dyn FnContext) -> Result<Value> {
         debug_assert!(!args.is_empty(), "unhex needs at least one argument");
+        let args = &*blobs_as_text(args, ctx);
         if args[0].is_null() {
             return Ok(Value::Null);
         }
@@ -286,8 +296,9 @@ impl ScalarFunction for Char {
 #[derive(Debug)]
 struct Unicode;
 impl ScalarFunction for Unicode {
-    fn call(&self, args: &[Value], _ctx: &mut dyn FnContext) -> Result<Value> {
+    fn call(&self, args: &[Value], ctx: &mut dyn FnContext) -> Result<Value> {
         debug_assert!(args.len() == 1, "unicode/1 arity precondition");
+        let args = blobs_as_text(args, ctx);
         Ok(match first_char_codepoint(&args[0]) {
             Some(cp) => Value::Integer(cp),
             None => Value::Null,

@@ -12,7 +12,9 @@
 
 use std::cmp::Ordering;
 
-use minisqlite_types::{apply_affinity, cast_to, compare_for_eq, Affinity, Error, Result, Value};
+use minisqlite_types::{
+    apply_affinity, cast_to_enc, compare_for_eq, Affinity, Error, Result, TextEncoding, Value,
+};
 
 use crate::coerce::{as_num, to_integer, truth, Num};
 use crate::context::{EvalContext, FnContext};
@@ -123,7 +125,7 @@ fn eval_plain(expr: &EvalExpr, regs: &[Value], ctx: &mut dyn EvalContext) -> Res
         EvalExpr::Concat { left, right } => {
             let l = eval(left, regs, ctx)?;
             let r = eval(right, regs, ctx)?;
-            Ok(concat(l, r))
+            Ok(concat(l, r, ctx.text_encoding()))
         }
 
         EvalExpr::Bitwise { op, left, right } => {
@@ -299,7 +301,10 @@ fn eval_plain(expr: &EvalExpr, regs: &[Value], ctx: &mut dyn EvalContext) -> Res
             }
         }
 
-        EvalExpr::Cast { affinity, operand } => Ok(cast_to(eval(operand, regs, ctx)?, *affinity)),
+        EvalExpr::Cast { affinity, operand } => {
+            let v = eval(operand, regs, ctx)?;
+            Ok(cast_to_enc(v, *affinity, ctx.text_encoding()))
+        }
 
         // COLLATE is a pass-through at eval time: the binder has already folded the
         // collation into the enclosing comparison/sort metadata.
@@ -324,7 +329,7 @@ fn eval_plain(expr: &EvalExpr, regs: &[Value], ctx: &mut dyn EvalContext) -> Res
                     if ev.is_null() {
                         return Ok(Value::Null);
                     }
-                    let et = as_text(ev);
+                    let et = as_text(ev, ctx.text_encoding());
                     let mut chars = et.chars();
                     match (chars.next(), chars.next()) {
                         (Some(c), None) => Some(c),
@@ -335,8 +340,9 @@ fn eval_plain(expr: &EvalExpr, regs: &[Value], ctx: &mut dyn EvalContext) -> Res
                 }
                 None => None,
             };
-            let s = as_text(sv);
-            let p = as_text(pv);
+            let enc = ctx.text_encoding();
+            let s = as_text(sv, enc);
+            let p = as_text(pv, enc);
             let matched = match kind {
                 LikeKind::Like => like_matches(&s, &p, esc),
                 // GLOB has no ESCAPE clause in SQL; `esc` is always None here.
@@ -410,16 +416,17 @@ fn finish3(negated: bool, res: Option<bool>) -> Value {
     bool_to_value(if negated { not3(res) } else { res })
 }
 
-/// Extract a text value's `String` after casting to TEXT affinity. Only ever called
+/// Extract a text value's `String` after casting to TEXT affinity (a BLOB read in the
+/// database encoding `enc`). Only ever called
 /// on non-NULL values (callers handle NULL), so the non-Text arm is unreachable:
 /// `cast_to(v, Text)` yields `Text` for every non-NULL `v` (INTEGER/REAL/TEXT/BLOB
 /// all convert), and returns NULL only for NULL. The empty-string fallback keeps the
 /// function total and panic-free; the `debug_assert` turns a caller that forgot to
 /// NULL-check — the one way to reach that fallback — into a loud test failure instead
 /// of a silent `""`.
-fn as_text(v: Value) -> String {
+fn as_text(v: Value, enc: TextEncoding) -> String {
     debug_assert!(!v.is_null(), "as_text on NULL: callers must NULL-check first");
-    match cast_to(v, Affinity::Text) {
+    match cast_to_enc(v, Affinity::Text, enc) {
         Value::Text(s) => s,
         _ => String::new(),
     }
@@ -653,12 +660,26 @@ fn shift_right(a: i64, b: i64) -> i64 {
 
 /// `||` string concatenation: NULL if either side is NULL, else both sides are cast
 /// to TEXT and joined.
-fn concat(l: Value, r: Value) -> Value {
+///
+/// On a UTF-16 database with a BLOB operand, sqlite joins the operands' BYTES in the
+/// database encoding (a BLOB's as they are) and reads the result as text in it, so an
+/// odd-length BLOB shifts the code units after it: `x'61' || 'b'` is `'\u{6261}'` on
+/// UTF-16le, not `'b'`.
+fn concat(l: Value, r: Value, enc: TextEncoding) -> Value {
     if l.is_null() || r.is_null() {
         return Value::Null;
     }
-    let mut s = as_text(l);
-    s.push_str(&as_text(r));
+    if enc != TextEncoding::Utf8 && (matches!(l, Value::Blob(_)) || matches!(r, Value::Blob(_))) {
+        let bytes_of = |v: Value| match cast_to_enc(v, Affinity::Blob, enc) {
+            Value::Blob(b) => b,
+            _ => Vec::new(),
+        };
+        let mut bytes = bytes_of(l);
+        bytes.extend(bytes_of(r));
+        return Value::Text(enc.decode_blob(&bytes));
+    }
+    let mut s = as_text(l, enc);
+    s.push_str(&as_text(r, enc));
     Value::Text(s)
 }
 

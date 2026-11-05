@@ -8,7 +8,7 @@
 //! a function implementation cannot reach the subquery machinery, and the executor
 //! can hand a function the smaller capability by upcasting.
 
-use minisqlite_types::{Result, Value};
+use minisqlite_types::{Result, TextEncoding, Value};
 
 use crate::ir::{CompareMeta, SubqueryId};
 
@@ -33,6 +33,14 @@ pub trait FnContext {
     fn changes(&self) -> i64;
     /// Total rows changed since the connection was opened.
     fn total_changes(&self) -> i64;
+
+    /// The database text encoding (fileformat2 §1.3.13), which every TEXT <-> BLOB
+    /// conversion goes through: `CAST(x AS BLOB)`, `hex(text)`, and a BLOB read as
+    /// TEXT (lang_expr.html "CAST expressions"). UTF-8 by default, so a context with
+    /// no database behind it (the test mocks) keeps the UTF-8 conversions.
+    fn text_encoding(&self) -> TextEncoding {
+        TextEncoding::Utf8
+    }
 
     // --- Ephemeral JSON value-subtype channel (json1.html §3.4) ---------------
     //

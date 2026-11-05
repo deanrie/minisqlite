@@ -22,6 +22,7 @@ use minisqlite_expr::{AggregateAccumulator, AggregateFunction, FnContext};
 use minisqlite_types::{integer_to_text, real_to_text, Collation, Result, Value};
 
 use crate::registry::{Arity, FunctionRegistry};
+use crate::scalar::blobs_as_text;
 
 /// Register `group_concat` (1 or 2 args) and its alias `string_agg` (exactly 2).
 pub(crate) fn register(reg: &mut FunctionRegistry) {
@@ -50,7 +51,8 @@ struct ConcatAcc {
 }
 
 impl AggregateAccumulator for ConcatAcc {
-    fn step(&mut self, args: &[Value], _ctx: &mut dyn FnContext) -> Result<()> {
+    fn step(&mut self, args: &[Value], ctx: &mut dyn FnContext) -> Result<()> {
+        let args = blobs_as_text(args, ctx);
         let x = &args[0];
         if x.is_null() {
             return Ok(()); // Skip the whole row: no value and no separator.

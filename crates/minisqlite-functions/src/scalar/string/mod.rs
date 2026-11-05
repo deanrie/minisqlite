@@ -21,8 +21,9 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 use minisqlite_expr::{to_integer, FnContext, ScalarFunction};
-use minisqlite_types::{integer_to_text, real_to_text, Error, Result, Value};
+use minisqlite_types::{integer_to_text, real_to_text, Error, Result, TextEncoding, Value};
 
+use super::blobs_as_text;
 use crate::registry::{Arity, FunctionRegistry};
 
 /// SQLite's default `SQLITE_MAX_LENGTH`: the largest string/blob the engine will
@@ -130,15 +131,20 @@ fn length_impl(v: &Value) -> Value {
 }
 
 /// `octet_length(X)` — the byte count of the value's representation: TEXT is its
-/// full UTF-8 byte length (NOT truncated at a NUL, unlike `length`), BLOB its byte
-/// count, INTEGER/REAL the byte length of the text rendering. NULL: NULL.
-fn octet_length_impl(v: &Value) -> Value {
+/// full byte length in the database encoding `enc` (NOT truncated at a NUL, unlike
+/// `length`), BLOB its byte count, INTEGER/REAL the byte length of the text
+/// rendering in `enc`. NULL: NULL.
+fn octet_length_impl(v: &Value, enc: TextEncoding) -> Value {
+    let text_len = |s: &str| match enc {
+        TextEncoding::Utf8 => s.len(),
+        TextEncoding::Utf16le | TextEncoding::Utf16be => 2 * s.encode_utf16().count(),
+    };
     let n = match v {
         Value::Null => return Value::Null,
         Value::Blob(b) => b.len(),
-        Value::Text(s) => s.len(),
-        Value::Integer(i) => integer_to_text(*i).len(),
-        Value::Real(r) => real_to_text(*r).len(),
+        Value::Text(s) => text_len(s),
+        Value::Integer(i) => text_len(&integer_to_text(*i)),
+        Value::Real(r) => text_len(&real_to_text(*r)),
     };
     Value::Integer(n as i64)
 }
@@ -470,9 +476,9 @@ impl ScalarFunction for Length {
 #[derive(Debug)]
 struct OctetLength;
 impl ScalarFunction for OctetLength {
-    fn call(&self, args: &[Value], _ctx: &mut dyn FnContext) -> Result<Value> {
+    fn call(&self, args: &[Value], ctx: &mut dyn FnContext) -> Result<Value> {
         debug_assert!(args.len() == 1, "octet_length/1 arity precondition");
-        Ok(octet_length_impl(&args[0]))
+        Ok(octet_length_impl(&args[0], ctx.text_encoding()))
     }
 }
 
@@ -490,8 +496,9 @@ impl ScalarFunction for Substr {
 #[derive(Debug)]
 struct Upper;
 impl ScalarFunction for Upper {
-    fn call(&self, args: &[Value], _ctx: &mut dyn FnContext) -> Result<Value> {
+    fn call(&self, args: &[Value], ctx: &mut dyn FnContext) -> Result<Value> {
         debug_assert!(args.len() == 1, "upper/1 arity precondition");
+        let args = blobs_as_text(args, ctx);
         Ok(upper_impl(&args[0]))
     }
 }
@@ -500,8 +507,9 @@ impl ScalarFunction for Upper {
 #[derive(Debug)]
 struct Lower;
 impl ScalarFunction for Lower {
-    fn call(&self, args: &[Value], _ctx: &mut dyn FnContext) -> Result<Value> {
+    fn call(&self, args: &[Value], ctx: &mut dyn FnContext) -> Result<Value> {
         debug_assert!(args.len() == 1, "lower/1 arity precondition");
+        let args = blobs_as_text(args, ctx);
         Ok(lower_impl(&args[0]))
     }
 }
@@ -510,8 +518,9 @@ impl ScalarFunction for Lower {
 #[derive(Debug)]
 struct Trim;
 impl ScalarFunction for Trim {
-    fn call(&self, args: &[Value], _ctx: &mut dyn FnContext) -> Result<Value> {
+    fn call(&self, args: &[Value], ctx: &mut dyn FnContext) -> Result<Value> {
         debug_assert!(matches!(args.len(), 1 | 2), "trim/1..2 arity precondition");
+        let args = blobs_as_text(args, ctx);
         Ok(trim_impl(&args[0], args.get(1), true, true))
     }
 }
@@ -520,8 +529,9 @@ impl ScalarFunction for Trim {
 #[derive(Debug)]
 struct Ltrim;
 impl ScalarFunction for Ltrim {
-    fn call(&self, args: &[Value], _ctx: &mut dyn FnContext) -> Result<Value> {
+    fn call(&self, args: &[Value], ctx: &mut dyn FnContext) -> Result<Value> {
         debug_assert!(matches!(args.len(), 1 | 2), "ltrim/1..2 arity precondition");
+        let args = blobs_as_text(args, ctx);
         Ok(trim_impl(&args[0], args.get(1), true, false))
     }
 }
@@ -530,8 +540,9 @@ impl ScalarFunction for Ltrim {
 #[derive(Debug)]
 struct Rtrim;
 impl ScalarFunction for Rtrim {
-    fn call(&self, args: &[Value], _ctx: &mut dyn FnContext) -> Result<Value> {
+    fn call(&self, args: &[Value], ctx: &mut dyn FnContext) -> Result<Value> {
         debug_assert!(matches!(args.len(), 1 | 2), "rtrim/1..2 arity precondition");
+        let args = blobs_as_text(args, ctx);
         Ok(trim_impl(&args[0], args.get(1), false, true))
     }
 }
@@ -540,8 +551,9 @@ impl ScalarFunction for Rtrim {
 #[derive(Debug)]
 struct Replace;
 impl ScalarFunction for Replace {
-    fn call(&self, args: &[Value], _ctx: &mut dyn FnContext) -> Result<Value> {
+    fn call(&self, args: &[Value], ctx: &mut dyn FnContext) -> Result<Value> {
         debug_assert!(args.len() == 3, "replace/3 arity precondition");
+        let args = blobs_as_text(args, ctx);
         replace_impl(&args[0], &args[1], &args[2])
     }
 }
@@ -550,8 +562,13 @@ impl ScalarFunction for Replace {
 #[derive(Debug)]
 struct Instr;
 impl ScalarFunction for Instr {
-    fn call(&self, args: &[Value], _ctx: &mut dyn FnContext) -> Result<Value> {
+    fn call(&self, args: &[Value], ctx: &mut dyn FnContext) -> Result<Value> {
         debug_assert!(args.len() == 2, "instr/2 arity precondition");
+        // Two BLOBs are searched byte-wise; otherwise both are read as text.
+        let args = match args {
+            [Value::Blob(_), Value::Blob(_)] => Cow::Borrowed(args),
+            _ => blobs_as_text(args, ctx),
+        };
         Ok(instr_impl(&args[0], &args[1]))
     }
 }
@@ -627,16 +644,16 @@ mod tests {
         // all bytes (3). This is the documented length/octet_length distinction.
         let s = t("a\0b");
         assert_eq!(int(&length_impl(&s)), 1);
-        assert_eq!(int(&octet_length_impl(&s)), 3);
+        assert_eq!(int(&octet_length_impl(&s, TextEncoding::Utf8)), 3);
     }
 
     #[test]
     fn octet_length_byte_counts() {
-        assert!(matches!(octet_length_impl(&Value::Null), Value::Null));
-        assert_eq!(int(&octet_length_impl(&t("abc"))), 3);
-        assert_eq!(int(&octet_length_impl(&t("café"))), 5); // é is 2 bytes
-        assert_eq!(int(&octet_length_impl(&Value::Blob(vec![0; 7]))), 7);
-        assert_eq!(int(&octet_length_impl(&Value::Integer(1000))), 4);
+        assert!(matches!(octet_length_impl(&Value::Null, TextEncoding::Utf8), Value::Null));
+        assert_eq!(int(&octet_length_impl(&t("abc"), TextEncoding::Utf8)), 3);
+        assert_eq!(int(&octet_length_impl(&t("café"), TextEncoding::Utf8)), 5); // é is 2 bytes
+        assert_eq!(int(&octet_length_impl(&Value::Blob(vec![0; 7]), TextEncoding::Utf8)), 7);
+        assert_eq!(int(&octet_length_impl(&Value::Integer(1000), TextEncoding::Utf8)), 4);
     }
 
     // ---- substr ----

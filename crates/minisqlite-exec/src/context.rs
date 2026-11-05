@@ -20,7 +20,9 @@ use std::collections::HashSet;
 
 use minisqlite_expr::{CompareMeta, EvalContext, FnContext, SubqueryId};
 use minisqlite_plan::{Plan, SubPlan};
-use minisqlite_types::{apply_affinity, compare_for_eq, Affinity, Error, Result, Row, Value};
+use minisqlite_types::{
+    apply_affinity, compare_for_eq, Affinity, Error, Result, Row, TextEncoding, Value,
+};
 
 use crate::corr_key::{corr_key, CorrCell};
 use crate::env::Env;
@@ -77,6 +79,10 @@ impl FnContext for EvalCtx<'_> {
 
     fn total_changes(&self) -> i64 {
         self.rt.total_changes()
+    }
+
+    fn text_encoding(&self) -> TextEncoding {
+        self.env.pagers.text_encoding()
     }
 
     // The ephemeral JSON value-subtype channel (json1.html §3.4). The evaluator sets

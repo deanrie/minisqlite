@@ -15,9 +15,9 @@
 //!   many read cursors — possibly across namespaces — borrow storage at once.
 
 use minisqlite_catalog::Catalog;
-use minisqlite_pager::Pager;
+use minisqlite_pager::{text_encoding_of, Pager};
 use minisqlite_plan::Plan;
-use minisqlite_types::{DbIndex, Error, Result};
+use minisqlite_types::{DbIndex, Error, Result, TextEncoding};
 
 /// Resolves a [`DbIndex`] (the namespace a plan node names) to the `&dyn Pager` backing
 /// it, for the READ path. `Copy`, so it rides inside the `Copy` [`Env`] with no allocation.
@@ -65,6 +65,17 @@ impl<'a> Pagers<'a> {
                 db.index()
             ))),
         }
+    }
+
+    /// The connection's text encoding (fileformat2 §1.3.13): `main`'s, which every
+    /// attached database shares in sqlite, or the one store a single-namespace context
+    /// holds. The expression evaluator reads it for TEXT <-> BLOB conversions.
+    pub(crate) fn text_encoding(self) -> TextEncoding {
+        let pager = match self {
+            Pagers::Set(set) => set.get(DbIndex::MAIN.index()).map(|b| &**b),
+            Pagers::One { pager, .. } => Some(pager),
+        };
+        pager.map(text_encoding_of).unwrap_or_default()
     }
 }
 

@@ -16,6 +16,7 @@ mod dbindex;
 mod error;
 mod namespace_meta;
 mod numeric;
+mod text_encoding;
 mod value;
 
 pub use dbindex::DbIndex;
@@ -37,4 +38,6 @@ pub use collation::{compare_text, Collation};
 
 pub use compare::{compare_for_eq, compare_values, extremum_wins, storage_class_rank};
 
-pub use cast::cast_to;
+pub use cast::{cast_to, cast_to_enc};
+
+pub use text_encoding::TextEncoding;

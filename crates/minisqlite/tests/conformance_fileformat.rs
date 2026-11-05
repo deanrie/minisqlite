@@ -946,6 +946,71 @@ fn utf16_supplementary_plane_char_round_trips() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// TEXT <-> BLOB conversions on a UTF-16 database. lang_expr.html "CAST expressions": a
+// cast to BLOB first casts "to TEXT in the encoding of the database connection", and a
+// BLOB cast to TEXT has its bytes read "as text encoded using the database encoding".
+// The same rule covers every place a TEXT value is read as a BLOB (`hex`,
+// `octet_length`) or a BLOB as TEXT (`||`, LIKE, the string functions). Expected values
+// are from sqlite3 3.51.3 on a file made with the same `PRAGMA encoding`.
+// ---------------------------------------------------------------------------
+
+/// A fresh database fixed to `encoding` holding one row `u(s) = 'ab'`.
+fn open_with_encoding(tmp: &TempDb, encoding: &str) -> Connection {
+    let mut db = tmp.open();
+    exec(&mut db, &format!("PRAGMA encoding = '{encoding}'"));
+    exec(&mut db, "CREATE TABLE u(s TEXT)");
+    exec(&mut db, "INSERT INTO u VALUES ('ab')");
+    db
+}
+
+#[test]
+fn utf16le_text_blob_conversions_use_the_database_encoding() {
+    let tmp = TempDb::new();
+    let mut db = open_with_encoding(&tmp, "UTF-16le");
+    assert_scalar(&mut db, "SELECT hex(s) FROM u", text("61006200"));
+    assert_scalar(&mut db, "SELECT length(CAST(s AS BLOB)) FROM u", int(4));
+    assert_scalar(&mut db, "SELECT CAST(s AS BLOB) = x'61006200' FROM u", int(1));
+    assert_scalar(&mut db, "SELECT hex('\u{e9}')", text("E900"));
+    assert_scalar(&mut db, "SELECT CAST(x'61006200' AS TEXT)", text("ab"));
+    assert_scalar(&mut db, "SELECT length(CAST(x'61006200' AS TEXT))", int(2));
+    assert_scalar(&mut db, "SELECT CAST(x'6162' AS TEXT) = 'ab'", int(0));
+    // An odd trailing byte is not a whole UTF-16 code unit and is dropped.
+    assert_scalar(&mut db, "SELECT CAST(x'610062' AS TEXT)", text("a"));
+    assert_scalar(&mut db, "SELECT CAST(CAST('\u{e9}' AS BLOB) AS TEXT)", text("\u{e9}"));
+    // A number cast to BLOB goes through its TEXT form in the database encoding, and a
+    // BLOB cast to a number is read as text in it.
+    assert_scalar(&mut db, "SELECT CAST(12 AS BLOB)", blob(&[0x31, 0, 0x32, 0]));
+    assert_scalar(&mut db, "SELECT CAST(x'31003200' AS INTEGER)", int(12));
+    // `hex` of a number keeps the UTF-8 rendering, as in sqlite.
+    assert_scalar(&mut db, "SELECT hex(12)", text("3132"));
+    assert_scalar(&mut db, "SELECT octet_length('ab')", int(4));
+    // `||` joins the operands' bytes in the database encoding.
+    assert_scalar(&mut db, "SELECT x'6100' || 'b'", text("ab"));
+    assert_scalar(&mut db, "SELECT hex(x'61' || 'b')", text("6162"));
+    assert_scalar(&mut db, "SELECT x'61006200' LIKE 'ab'", int(1));
+    assert_scalar(&mut db, "SELECT upper(x'61006200')", text("AB"));
+    assert_scalar(&mut db, "SELECT instr(x'61006200', 'b')", int(2));
+    // Two BLOBs are still searched byte-wise.
+    assert_scalar(&mut db, "SELECT instr(x'61006200', x'6200')", int(3));
+    assert_scalar(&mut db, "SELECT unicode(x'e900')", int(233));
+    assert_scalar(&mut db, "SELECT group_concat(CAST(s AS BLOB)) FROM u", text("ab"));
+}
+
+#[test]
+fn utf16be_text_blob_conversions_use_the_database_encoding() {
+    let tmp = TempDb::new();
+    let mut db = open_with_encoding(&tmp, "UTF-16be");
+    assert_scalar(&mut db, "SELECT hex(s) FROM u", text("00610062"));
+    assert_scalar(&mut db, "SELECT hex('\u{e9}')", text("00E9"));
+    assert_scalar(&mut db, "SELECT CAST(x'00610062' AS TEXT)", text("ab"));
+    assert_scalar(&mut db, "SELECT CAST(x'61006200' AS TEXT)", text("\u{6100}\u{6200}"));
+    assert_scalar(&mut db, "SELECT CAST(12 AS BLOB)", blob(&[0, 0x31, 0, 0x32]));
+    assert_scalar(&mut db, "SELECT CAST(x'00310032' AS INTEGER)", int(12));
+    assert_scalar(&mut db, "SELECT hex(x'61' || 'b')", text("6100"));
+    assert_scalar(&mut db, "SELECT unicode(x'00e9')", int(233));
+}
+
 #[test]
 fn auto_vacuum_full_sets_header_fields() {
     // §1.3.12 (offsets 52 and 64): in auto-/incremental-vacuum mode the file carries
