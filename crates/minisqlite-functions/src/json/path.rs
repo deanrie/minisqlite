@@ -12,11 +12,10 @@
 //! * **Read** ([`navigate`]) — follow existing structure and return the selected
 //!   node, or `None` if the path selects nothing. Used by `json_extract`,
 //!   `json_type`, and `json_array_length`.
-//! * **Edit** ([`apply_edit`], [`remove_at`]) — walk to the parent of the final
-//!   step and mutate. Create/overwrite is governed by [`SetMode`] so one walk backs
-//!   `json_insert` (create only), `json_replace` (overwrite only), and `json_set`
-//!   (both). A missing intermediate container makes the edit a no-op, matching
-//!   SQLite (only the final step is created).
+//! * **Edit** ([`apply_edit`], [`remove_at`]) — walk the path and mutate.
+//!   Create/overwrite is governed by [`SetMode`] so one walk backs `json_insert`
+//!   (create only), `json_replace` (overwrite only), and `json_set` (both). The
+//!   creating modes also add any missing intermediate containers, matching SQLite.
 
 use std::borrow::Cow;
 
@@ -252,63 +251,87 @@ fn navigate_parent_mut<'a>(root: &'a mut Json, steps: &[Step]) -> Option<&'a mut
 
 /// Apply one path/value edit under [`SetMode`]. An empty step list is the root path
 /// `$`: overwrite modes replace the whole document, `Insert` is a no-op (the root
-/// already exists). Otherwise walk to the parent and create/overwrite the final
-/// step; a missing parent or a type mismatch leaves the value unchanged.
+/// already exists).
+///
+/// The walk follows existing structure. At the first step that selects nothing, a
+/// creating mode adds the rest of the path as new containers ending in `value`, as
+/// SQLite does: `json_set('{}','$.a.b',1)` is `{"a":{"b":1}}`. A missing object
+/// label is created; a missing array element is created only at the append
+/// position (`[N]` with N equal to the length, `[#]`, or `[#-0]`), so
+/// `json_set('[1,2]','$[5]',9)` leaves the array alone. A type mismatch (a label on
+/// an array, an index on an object or a scalar) leaves the value unchanged.
 pub(crate) fn apply_edit(root: &mut Json, steps: &[Step], value: Json, mode: SetMode) {
-    if steps.is_empty() {
-        if mode.overwrites() {
-            *root = value;
-        }
-        return;
+    let mut cur = root;
+    for (pos, step) in steps.iter().enumerate() {
+        let rest = &steps[pos + 1..];
+        cur = match (cur, step) {
+            (Json::Object(members), Step::Key(k)) => {
+                match members.iter().position(|(mk, _)| mk == k) {
+                    Some(i) => &mut members[i].1,
+                    None => {
+                        if mode.creates() && let Some(node) = build_path(rest, value) {
+                            members.push((k.clone(), node));
+                        }
+                        return;
+                    }
+                }
+            }
+            (Json::Array(items), Step::Index(idx)) => {
+                match resolve_index_read(*idx, items.len()) {
+                    Some(i) => &mut items[i],
+                    None => {
+                        if mode.creates()
+                            && is_append_index(*idx, items.len())
+                            && let Some(node) = build_path(rest, value)
+                        {
+                            items.push(node);
+                        }
+                        return;
+                    }
+                }
+            }
+            _ => return,
+        };
     }
-    let last = &steps[steps.len() - 1];
-    let Some(parent) = navigate_parent_mut(root, steps) else {
-        return;
-    };
-    match (parent, last) {
-        (Json::Object(members), Step::Key(k)) => {
-            let existing = members.iter_mut().find(|(mk, _)| *mk == *k);
-            match existing {
-                Some((_, v)) => {
-                    if mode.overwrites() {
-                        *v = value;
-                    }
-                }
-                None => {
-                    if mode.creates() {
-                        members.push((k.clone(), value));
-                    }
-                }
-            }
-        }
-        (Json::Array(items), Step::Index(idx)) => match idx {
-            Index::At(n) => {
-                if *n < items.len() {
-                    if mode.overwrites() {
-                        items[*n] = value;
-                    }
-                } else if mode.creates() {
-                    // An index at or past the end appends one element.
-                    items.push(value);
-                }
-            }
-            Index::FromEnd(k) => {
-                if let Some(i) = resolve_index_read(Index::FromEnd(*k), items.len()) {
-                    if mode.overwrites() {
-                        items[i] = value;
-                    }
-                }
-                // Out of range from the end: no create target, so a no-op.
-            }
-            Index::Append => {
-                if mode.creates() {
-                    items.push(value);
-                }
-            }
-        },
-        // Type mismatch (e.g. a key on an array): silently ignored, as SQLite does.
-        _ => {}
+    if mode.overwrites() {
+        *cur = value;
     }
+}
+
+/// Whether `idx` names the position one past the end of an array of length `len`,
+/// the only position an edit can create an element at.
+fn is_append_index(idx: Index, len: usize) -> bool {
+    match idx {
+        Index::At(n) => n == len,
+        Index::FromEnd(k) => k == 0,
+        Index::Append => true,
+    }
+}
+
+/// Deepest chain of missing containers one edit may create. The rendering and drop
+/// of [`Json`] recurse, so this keeps a hostile path such as `$.a.a.a…` from
+/// building a value deep enough to overflow the stack; it matches the parser's
+/// nesting limit. SQLite has no such check (it crashes on a path of 100000 labels).
+const MAX_CREATE_DEPTH: usize = 1000;
+
+/// Build the new value for a path whose first `steps` do not exist yet: each label
+/// becomes a one-member object and each append index a one-element array, wrapped
+/// around `value`. Returns `None` if a step cannot be created in an empty container
+/// (an index other than `[0]`, `[#]` or `[#-0]`), in which case the edit changes
+/// nothing.
+fn build_path(steps: &[Step], value: Json) -> Option<Json> {
+    if steps.len() > MAX_CREATE_DEPTH {
+        return None;
+    }
+    let mut node = value;
+    for step in steps.iter().rev() {
+        node = match step {
+            Step::Key(k) => Json::Object(vec![(k.clone(), node)]),
+            Step::Index(idx) if is_append_index(*idx, 0) => Json::Array(vec![node]),
+            Step::Index(_) => return None,
+        };
+    }
+    Some(node)
 }
 
 /// Remove the element selected by `steps` in place. A missing element, a `[#]`/out-
@@ -472,9 +495,37 @@ mod tests {
         // `[1]` overwrites under set.
         apply_edit(&mut root, &steps("$[1]"), Json::Integer(22), SetMode::Set);
         assert_eq!(root.to_text(), "[1,22,3,99]");
-        // Missing intermediate -> no-op.
+        // A label on an array is a type mismatch -> no-op.
         apply_edit(&mut root, &steps("$.x.y"), Json::Integer(5), SetMode::Set);
         assert_eq!(root.to_text(), "[1,22,3,99]");
+        // An index past the append position creates nothing.
+        apply_edit(&mut root, &steps("$[9]"), Json::Integer(5), SetMode::Set);
+        assert_eq!(root.to_text(), "[1,22,3,99]");
+        // `[#-0]` is the append position.
+        apply_edit(&mut root, &steps("$[#-0]"), Json::Integer(5), SetMode::Insert);
+        assert_eq!(root.to_text(), "[1,22,3,99,5]");
+    }
+
+    #[test]
+    fn creating_modes_build_the_missing_rest_of_the_path() {
+        let mut root = Json::Object(vec![]);
+        apply_edit(&mut root, &steps("$.a[0].b"), Json::Integer(1), SetMode::Set);
+        assert_eq!(root.to_text(), r#"{"a":[{"b":1}]}"#);
+        // Only the append position can start a new array.
+        apply_edit(&mut root, &steps("$.c[1]"), Json::Integer(2), SetMode::Insert);
+        assert_eq!(root.to_text(), r#"{"a":[{"b":1}]}"#);
+        // json_replace creates nothing.
+        apply_edit(&mut root, &steps("$.d.e"), Json::Integer(3), SetMode::Replace);
+        assert_eq!(root.to_text(), r#"{"a":[{"b":1}]}"#);
+        // A path deeper than the cap changes nothing instead of building a value
+        // too deep to render.
+        let deep = format!("${}", ".a".repeat(MAX_CREATE_DEPTH + 2));
+        let mut root = Json::Object(vec![]);
+        apply_edit(&mut root, &steps(&deep), Json::Integer(1), SetMode::Set);
+        assert_eq!(root.to_text(), "{}");
+        let deep = format!("${}", ".a".repeat(MAX_CREATE_DEPTH + 1));
+        apply_edit(&mut root, &steps(&deep), Json::Integer(1), SetMode::Set);
+        assert_eq!(navigate(&root, &steps(&deep)), Some(&Json::Integer(1)));
     }
 
     #[test]
