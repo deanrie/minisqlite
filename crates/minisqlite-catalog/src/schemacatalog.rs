@@ -25,14 +25,14 @@ use std::collections::{HashMap, HashSet};
 use minisqlite_btree::{
     create_index_btree, create_table_btree, table_delete, table_insert, TableCursor,
 };
-use minisqlite_fileformat::{decode_record_enc, DatabaseHeader, HEADER_SIZE};
+use minisqlite_fileformat::{decode_record_enc, encode_record_enc, DatabaseHeader, HEADER_SIZE};
 use minisqlite_pager::{text_encoding_of, PageId, Pager};
 use minisqlite_sql::{
     parse, AlterAction, AlterTable, ColumnConstraintKind, ColumnDef as SqlColumnDef, CreateIndex,
     CreateTable, CreateTableBody, CreateTrigger, CreateView, DefaultValue, Drop, DropKind,
     IndexedColumnTarget, Literal, Statement, TriggerTiming,
 };
-use minisqlite_types::{Error, Result};
+use minisqlite_types::{Error, Result, Value};
 
 use crate::alter_data;
 use crate::alter_rewrite;
@@ -638,6 +638,18 @@ impl Catalog for SchemaCatalog {
                     }
                     return Err(Error::Sql(format!("no such table: {name}")));
                 }
+                // An AUTOINCREMENT table's `sqlite_sequence` row goes with it, as in
+                // sqlite3's `DELETE FROM sqlite_sequence WHERE name=<table>` on DROP, so a
+                // table re-created under the same name starts again from rowid 1.
+                let dropped = &self.tables[&key];
+                if dropped.autoincrement {
+                    let table = dropped.name.clone();
+                    if let Some((root, rows)) = self.sequence_rows_named(&*pager, &table)? {
+                        for (rowid, _) in rows {
+                            table_delete(pager, root, rowid)?;
+                        }
+                    }
+                }
                 // CASCADE: the table's own row plus every dependent index/trigger row.
                 // Reading page 1 (not the cache) makes the cascade faithful for a
                 // loaded-from-disk schema, whose triggers are not modelled in the cache.
@@ -1012,6 +1024,34 @@ impl SchemaCatalog {
         Ok(out)
     }
 
+    /// This store's `sqlite_sequence` root and the `(rowid, [name, seq, ..])` of each of
+    /// its rows whose `name` is exactly `table` (sqlite3 matches with a plain `name = ?`,
+    /// so the comparison is case-sensitive), or `None` when this store has no
+    /// `sqlite_sequence` (no AUTOINCREMENT table was ever created in it).
+    /// Read-only, like [`collect_schema_rows`](Self::collect_schema_rows): the caller
+    /// rewrites or deletes the rows after the cursor is dropped.
+    fn sequence_rows_named(
+        &self,
+        pager: &dyn Pager,
+        table: &str,
+    ) -> Result<Option<(PageId, Vec<(i64, Vec<Value>)>)>> {
+        let Some(seq) = self.tables.get(&norm("sqlite_sequence")) else {
+            return Ok(None);
+        };
+        let enc = text_encoding_of(pager);
+        let mut out = Vec::new();
+        let mut cursor = TableCursor::open(pager, seq.root_page)?;
+        let mut positioned = cursor.first()?;
+        while positioned {
+            let values = decode_record_enc(&cursor.payload()?, enc);
+            if matches!(values.first(), Some(Value::Text(name)) if name == table) {
+                out.push((cursor.rowid(), values));
+            }
+            positioned = cursor.next()?;
+        }
+        Ok(Some((seq.root_page, out)))
+    }
+
     /// `ALTER TABLE <t> ADD [COLUMN] <coldef>`: append the column to the table's
     /// stored `CREATE TABLE` text and rebuild its cached def. Existing rows are NOT
     /// rewritten — a now-short row reads its new trailing column as NULL
@@ -1299,6 +1339,14 @@ impl SchemaCatalog {
         }
         for (rowid, row) in &trigger_persists {
             table_insert(pager, SCHEMA_ROOT, *rowid, &row.to_record_enc(enc))?;
+        }
+        // sqlite3 also runs `UPDATE sqlite_sequence SET name=<new> WHERE name=<old>`, so
+        // the AUTOINCREMENT high-water follows the table instead of being lost.
+        if let Some((root, rows)) = self.sequence_rows_named(&*pager, &old_name)? {
+            for (rowid, mut values) in rows {
+                values[0] = Value::Text(new_name.to_string());
+                table_insert(pager, root, rowid, &encode_record_enc(&values, enc))?;
+            }
         }
         bump_schema_cookie(pager)?;
 
