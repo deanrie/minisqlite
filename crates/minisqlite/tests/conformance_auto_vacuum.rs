@@ -358,10 +358,11 @@ fn auto_vacuum_file_reopens_and_round_trips_rows_and_index() {
 // ===========================================================================
 // DROP TABLE in auto_vacuum mode must not crash and must leave a structurally
 // valid file: the dropped table's pages become FREEPAGE (type 2) entries, never
-// an unrepresentable type-0. (Regression: `DROP TABLE` frees no pages in the
-// catalog, so its former root/leaves are allocated-but-unreferenced; the ptrmap
-// writer used to `debug_assert!` (panic) / emit an invalid type-0 for them. The
-// finalize leak sweep now puts them on the freelist instead.)
+// an unrepresentable type-0. (Regression: `DROP TABLE` used to free no pages in
+// the catalog, leaving its former root/leaves allocated-but-unreferenced, and the
+// ptrmap writer used to `debug_assert!` (panic) / emit an invalid type-0 for them.
+// DROP now frees the pages itself; the finalize leak sweep remains as the safety
+// net for files that already carry leaked pages.)
 // ===========================================================================
 
 #[test]

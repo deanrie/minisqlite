@@ -23,7 +23,7 @@
 use std::collections::{HashMap, HashSet};
 
 use minisqlite_btree::{
-    create_index_btree, create_table_btree, table_delete, table_insert, TableCursor,
+    create_index_btree, create_table_btree, drop_btree, table_delete, table_insert, TableCursor,
 };
 use minisqlite_fileformat::{decode_record_enc, DatabaseHeader, HEADER_SIZE};
 use minisqlite_pager::{text_encoding_of, PageId, Pager};
@@ -610,12 +610,14 @@ impl Catalog for SchemaCatalog {
         let name = &stmt.name.name;
         let key = norm(name);
 
-        // TODO(freelist): reclaim the dropped object's root+descendant pages once a
-        // btree free-tree/freelist helper exists. Today `table_delete` frees no pages,
-        // so a dropped table (with its indexes' b-trees) or index leaks its pages; the
-        // b-tree layer's stance is that a leaked page never affects query correctness,
-        // only file size. Views and triggers own no b-tree (rootpage 0), so dropping one
-        // leaks nothing beyond its page-1 row, which `table_delete` does remove.
+        // Every b-tree the dropped object owns (a table's own tree plus each of its
+        // indexes and auto-indexes, or the one index tree) is freed to the freelist in
+        // this same statement via `drop_btree`, as real sqlite does (`destroyTable` /
+        // `destroyRootPage`). A page left allocated but unreferenced is not harmless:
+        // sqlite3's `PRAGMA integrity_check` reports it as "Page N: never used". The frees
+        // run inside the caller's write transaction, so ROLLBACK restores the trees and
+        // the freelist. Views and triggers own no b-tree (rootpage 0), so dropping one
+        // frees nothing beyond its page-1 row, which `table_delete` removes.
         //
         // Ordering mirrors the create path's cache-last discipline in reverse: delete
         // the page-1 row(s) and bump the cookie FIRST, then mutate the cache, so an
@@ -646,16 +648,18 @@ impl Catalog for SchemaCatalog {
                 // `main.t` shares this bare `tbl_name` "t" but must survive a `DROP TABLE
                 // temp.t`. The engine cascades those from their OWN (db, table) separately.
                 let foreign = self.foreign_trigger_names_folded();
-                let rowids = self.schema_rows_to_delete(&*pager, |row| {
+                let rows = self.collect_schema_rows(&*pager, |row| {
                     (row.obj_type == "table" && norm(&row.name) == key)
                         || (row.obj_type == "index" && norm(&row.tbl_name) == key)
                         || (row.obj_type == "trigger"
                             && norm(&row.tbl_name) == key
                             && !foreign.contains(&norm(&row.name)))
                 })?;
-                for rowid in rowids {
+                let roots = owned_btree_roots(&rows)?;
+                for (rowid, _) in rows {
                     table_delete(pager, SCHEMA_ROOT, rowid)?;
                 }
+                free_btrees(pager, roots)?;
                 bump_schema_cookie(pager)?;
                 // Cache last: drop the table, every index the cache linked to it, and
                 // every SAME-STORE cached trigger that fires on it (a cross-namespace temp
@@ -691,13 +695,14 @@ impl Catalog for SchemaCatalog {
                     return Err(Error::Sql(format!("no such index: {name}")));
                 };
                 let owning_table = norm(&def.table);
-                let rowids = self
-                    .schema_rows_to_delete(&*pager, |row| {
-                        row.obj_type == "index" && norm(&row.name) == key
-                    })?;
-                for rowid in rowids {
+                let rows = self.collect_schema_rows(&*pager, |row| {
+                    row.obj_type == "index" && norm(&row.name) == key
+                })?;
+                let roots = owned_btree_roots(&rows)?;
+                for (rowid, _) in rows {
                     table_delete(pager, SCHEMA_ROOT, rowid)?;
                 }
+                free_btrees(pager, roots)?;
                 bump_schema_cookie(pager)?;
                 // Cache last: drop the def and unlink it from its table's ordered list.
                 self.indexes.remove(&key);
@@ -2065,6 +2070,33 @@ fn checked_root_page(row: &SchemaRow) -> Result<PageId> {
             row.name, row.rootpage
         ))
     })
+}
+
+/// The b-tree roots owned by the `sqlite_schema` rows a DROP is about to delete: every
+/// `table` / `index` row with a non-zero `rootpage` (a view or trigger row, and a
+/// virtual table's row, has rootpage 0 and owns no b-tree). Read before the rows are
+/// deleted; validated with [`checked_root_page`] so a corrupt rootpage fails the DROP
+/// before anything is written.
+fn owned_btree_roots(rows: &[(i64, SchemaRow)]) -> Result<Vec<PageId>> {
+    rows.iter()
+        .filter(|(_, row)| {
+            (row.obj_type == "table" || row.obj_type == "index") && row.rootpage != 0
+        })
+        .map(|(_, row)| checked_root_page(row))
+        .collect()
+}
+
+/// Free every page of each dropped b-tree to the freelist. Largest root first, the
+/// order sqlite's `destroyTable` uses (it does so for auto_vacuum root moves; here the
+/// commit-time ptrmap pass re-packs roots, so the order only keeps the freelist layout
+/// close to sqlite's).
+fn free_btrees(pager: &mut dyn Pager, mut roots: Vec<PageId>) -> Result<()> {
+    roots.sort_unstable_by(|a, b| b.cmp(a));
+    roots.dedup();
+    for root in roots {
+        drop_btree(pager, root)?;
+    }
+    Ok(())
 }
 
 /// The canonical name of the schema table.

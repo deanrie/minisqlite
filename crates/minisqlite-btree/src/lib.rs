@@ -26,6 +26,9 @@
 //!   changes), rebalance-on-underflow (rotate / merge to keep non-root interiors at
 //!   `K >= 2`), and reclaiming the freed pages and overflow chains to the freelist.
 //! - [`cursor`] — [`TableCursor`], a borrowing forward/seek reader.
+//! - [`drop_tree`] — `drop_btree`: free every page of a whole table or index b-tree
+//!   (root, interior, leaf, overflow chains) to the freelist, for `DROP TABLE` /
+//!   `DROP INDEX`.
 //!
 //! The index b-tree mirrors that structure for key-record (not rowid) pages:
 //!
@@ -46,6 +49,7 @@ mod build;
 mod count;
 mod cursor;
 mod delete;
+mod drop_tree;
 mod insert;
 mod nav;
 mod overflow_io;
@@ -62,6 +66,7 @@ mod index_nav;
 pub use count::{index_entry_count, table_entry_count};
 pub use cursor::TableCursor;
 pub use delete::table_delete;
+pub use drop_tree::drop_btree;
 pub use insert::table_insert;
 pub use tree::{create_table_btree, init_database};
 

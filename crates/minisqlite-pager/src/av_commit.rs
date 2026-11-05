@@ -65,7 +65,7 @@ pub(crate) fn finalize_and_compact<S: PageStore>(cow: &mut Cow<S>) -> Result<boo
     let mut moved_roots = crate::ptrmap_build::finalize(cow)?;
 
     // 2. Gate on FULL auto_vacuum (off52 != 0 AND off64 == 0) with something to reclaim.
-    //    Read AFTER finalize so `freelist_count` reflects any DROP-leaked pages it swept.
+    //    Read AFTER finalize so `freelist_count` reflects any leaked pages it swept.
     if !full_with_reclaimable_free_pages(cow)? {
         return Ok(moved_roots);
     }
@@ -102,7 +102,7 @@ pub(crate) fn finalize_and_compact<S: PageStore>(cow: &mut Cow<S>) -> Result<boo
 /// Whether the committing database is FULL auto_vacuum — offset 52 largest-root != 0 (auto_
 /// vacuum on) AND offset 64 incremental-flag == 0 (FULL, not INCREMENTAL) — and currently
 /// holds at least one free page (offset 36). Reads page 1 through the transaction overlay, so
-/// it sees the header `finalize` just wrote, including the freelist count after any DROP-leak
+/// it sees the header `finalize` just wrote, including the freelist count after any leak
 /// sweep. A malformed or too-short page 1 — never the real engine path, since `finalize`
 /// already validated it — reports `false` (fail closed: skip compaction rather than act on a
 /// header we cannot trust).

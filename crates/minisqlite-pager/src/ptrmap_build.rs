@@ -35,10 +35,12 @@
 //! "allocated but unreferenced" entry. [`finalize`] therefore guarantees every
 //! allocated page falls into one of those buckets before it writes the ptrmap: the
 //! forest walk classifies the reachable pages, and [`sweep_leaked_pages`] puts any
-//! remaining allocated page (a leak) onto the freelist. The one leak source today is
-//! `DROP TABLE`, which unlinks a table's schema row without freeing its b-tree pages;
-//! the sweep turns those into legitimate FREEPAGE entries (and reclaimable space)
-//! rather than leaving a page the ptrmap cannot represent. The forest walk fails closed
+//! remaining allocated page (a leak) onto the freelist. `DROP TABLE` / `DROP INDEX` free
+//! the dropped b-trees themselves, so a healthy commit has no leak; the sweep is the
+//! safety net for a file that already carries leaked pages (for example one written by
+//! an earlier build whose DROP freed nothing), turning them into legitimate FREEPAGE
+//! entries (and reclaimable space) rather than leaving a page the ptrmap cannot
+//! represent. The forest walk fails closed
 //! on a corrupt page (see [`walk_tree`]) so the sweep can never mistake a live page for
 //! a leak. DDL/DML otherwise run as one wrapped write transaction, so finalize sees the
 //! consistent end-of-statement state, never a page allocated-but-not-yet-linked
@@ -193,9 +195,10 @@ fn derive_entries<S: PageStore>(
     }
 
     // 2. Reclaim any LEAKED page — allocated, but neither reachable from the forest nor
-    //    on the freelist — by putting it on the freelist. `DROP TABLE` currently frees
-    //    no pages (a documented catalog leak), so without this a dropped root would be
-    //    an allocated page with no possible §1.8 classification: `write_ptrmap_pages`
+    //    on the freelist — by putting it on the freelist. `DROP TABLE` / `DROP INDEX`
+    //    free their b-trees, but a file can still arrive with leaked pages (an earlier
+    //    build's DROP freed nothing), and such a page would be an allocated page with
+    //    no possible §1.8 classification: `write_ptrmap_pages`
     //    would have to invent an invalid type-0 entry (or, in debug, panic). Sweeping it
     //    onto the freelist makes it a legitimate FREEPAGE, keeps the file structurally
     //    valid for cross-read, AND makes the space reclaimable by compaction. A no-op
@@ -220,10 +223,11 @@ fn derive_entries<S: PageStore>(
 
 /// Reclaim leaked pages onto the freelist so every allocated page is classifiable as a
 /// §1.8 ptrmap entry. A "leak" is a page in `2..=count` that is not a ptrmap position,
-/// not reachable from the forest (`live`), and not already on the freelist. Today the
-/// only source is `DROP TABLE`, which removes a table's schema row without freeing its
-/// b-tree pages; in a healthy forest there are no leaks and this returns after a single
-/// O(1) arithmetic check, so the common commit pays nothing.
+/// not reachable from the forest (`live`), and not already on the freelist. DROP frees
+/// its b-trees itself, so the remaining source is a file that already holds leaked
+/// pages (for example from an earlier build whose `DROP TABLE` freed nothing); in a
+/// healthy forest there are no leaks and this returns after a single O(1) arithmetic
+/// check, so the common commit pays nothing.
 ///
 /// Correctness rests on [`walk_tree`] failing closed on a corrupt page: if a live
 /// subtree were silently dropped from `live`, those pages would look leaked and be

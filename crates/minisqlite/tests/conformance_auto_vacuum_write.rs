@@ -658,12 +658,12 @@ fn verify_ptrmap(db: &RawDb, incremental: bool) -> std::collections::BTreeSet<u8
 // (type 3/4); a scratch table whose rows are all DELETEd stocks the freelist (type 2);
 // the index adds a root (type 1) and non-root index pages (type 5).
 //
-// Freelist coverage uses DELETE, not DROP, on purpose: `DELETE` reclaims the emptied
-// b-tree's data pages to the freelist (see `minisqlite-btree`'s `delete.rs`), whereas
-// `DROP TABLE` does NOT yet reclaim the dropped object's pages (a pre-existing, documented
-// gap in `minisqlite_catalog`'s `drop_object`). Building the freelist via DELETE keeps
-// this a strong, well-formed check — every page is reachable or free, so the reconstructed
-// map must match the on-disk ptrmap exactly, with no orphaned pages to explain away.
+// Freelist coverage uses DELETE: it reclaims the emptied b-tree's data pages to the
+// freelist (see `minisqlite-btree`'s `delete.rs`) while the table stays live, so the
+// file has every entry type at once. Every page is reachable or free, so the
+// reconstructed map must match the on-disk ptrmap exactly, with no orphaned pages to
+// explain away. (`DROP TABLE` frees its pages too; `conformance_drop_freelist.rs`
+// covers that.)
 // ---------------------------------------------------------------------------
 
 /// Build a rich auto_vacuum database of the given mode (1 = FULL, 2 = INCREMENTAL) at
@@ -913,7 +913,7 @@ fn roots_first_holds_when_low_slots_are_free_before_create_index() {
 /// The FREE-TARGET branch of `roots_first::enforce`, exercised DETERMINISTICALLY (the sister
 /// test above can hit the SWAP branch instead, since its low slots may stay live). Create
 /// three tables FIRST so their roots are exactly pages 3, 4, 5, populate the OUTER two, then
-/// `DROP TABLE mid`. The dropped root (page 4) is swept onto the freelist during that commit,
+/// `DROP TABLE mid`. The dropped root (page 4) is put on the freelist by that DROP,
 /// so when `enforce` re-packs the two survivors to the lowest slots [3, 4], the target slot 4
 /// holds a FREE page — forcing the branch that MOVES a root into a free slot (no live blocker
 /// to swap) and rebuilds the freelist. The witness that this branch (not SWAP) ran: `hi`'s old
