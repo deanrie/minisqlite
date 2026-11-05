@@ -12,11 +12,9 @@
 //! `sqlite3_value_double` ([`value_to_f64`]), string conversions take the text view.
 //! A missing argument (too few supplied) is a NULL, i.e. 0 / 0.0 / "".
 //!
-//! Known residuals vs real SQLite (documented, not spec errors): float conversions
-//! use Rust's correctly-rounded formatter, whereas SQLite caps a rendering at 16
-//! significant digits (26 with `!`), so a very high precision or very large
-//! magnitude can differ in trailing digits; and exact-halfway rounding follows
-//! Rust/C round-half-to-even. Common precisions and magnitudes match.
+//! Float conversions follow SQLite's own decimal conversion ([`fp_decode`]): at most
+//! 16 significant digits (26 with `!`, printf.html §1.2), rounded half away from
+//! zero, so `%.0f` of `0.5` is `1` and `%.20f` of `0.1` is `0.10000000000000000000`.
 
 use minisqlite_expr::{to_integer, FnContext, ScalarFunction};
 use minisqlite_types::{parse_real_prefix, Result, Value};
@@ -448,166 +446,217 @@ fn group_commas(digits: &str) -> String {
 // ---------------------------------------------------------------------------
 
 fn render_float(out: &mut Vec<u8>, spec: &Spec, value: f64, ty: u8) {
-    let neg = value.is_sign_negative();
-    if !value.is_finite() {
-        // Inf/NaN render as words; the 0 flag switches them to SQL/JSON literals.
-        let body: &[u8] = if value.is_nan() {
-            if spec.zero {
-                b"null"
-            } else {
-                b"NaN"
-            }
-        } else if spec.zero {
-            b"9.0e+999"
+    let zero_inf = value.is_infinite() && spec.zero;
+    if !value.is_finite() && !zero_inf {
+        // NaN renders as `NaN` (`null` with the 0 flag) and carries no sign; Inf
+        // renders as `Inf` with the usual sign flags. Neither is zero-padded.
+        let (sign, body) = if value.is_nan() {
+            ("", if spec.zero { "null" } else { "NaN" })
         } else {
-            b"Inf"
+            (sign_str(value < 0.0, spec), "Inf")
         };
-        // NaN carries no sign; Inf follows the usual sign flags.
-        let sign = if value.is_nan() { "" } else { sign_str(neg, spec) };
-        // Non-finite values are never zero-padded.
-        let bodystr = std::str::from_utf8(body).expect("ascii");
-        push_padded_numeric(out, spec, sign, bodystr, false);
+        push_padded_numeric(out, spec, sign, body, false);
         return;
     }
 
-    // `#` (alt) and `!` (alt2) both force a decimal point; `!` additionally forces at
-    // least one fractional digit (SQLite's alternate-form-2 for floats).
-    let force_point = spec.alt || spec.alt2;
-    let min_frac = spec.alt2;
-    let mag = value.abs();
-    let mut suppress_sign = false;
-    let body = match ty {
-        b'f' => {
-            let prec = float_prec(spec, 6);
-            let mut s = format!("{:.*}", prec, mag);
-            apply_float_altforms(&mut s, force_point, min_frac);
-            // Alternate form suppresses a negative sign when every digit is 0.
-            if spec.alt && !spec.plus && neg && all_zero_digits(&s) {
-                suppress_sign = true;
-            }
-            if spec.comma {
-                s = comma_float(&s);
-            }
-            s
+    // The steps below follow the float case of SQLite's `sqlite3_str_vappendf`.
+    let mut precision = spec.precision.unwrap_or(6).min(SAFE_FIELD as usize) as i32;
+    let general = matches!(ty, b'g' | b'G');
+    let round = match ty {
+        b'f' => -precision,
+        b'g' | b'G' => {
+            precision = precision.max(1);
+            precision
         }
-        b'e' | b'E' => {
-            let prec = float_prec(spec, 6);
-            format_exp(mag, prec, ty == b'E', force_point, min_frac)
+        _ => precision + 1,
+    };
+    // printf.html §1.2: at most 16 significant digits, 26 with the `!` flag.
+    let max_digits = if spec.alt2 { 26 } else { 16 };
+    // With the 0 flag, Inf prints as the digit 9 followed by 999 zeros.
+    let (digits, point) = if zero_inf {
+        (vec![b'9'], 1000)
+    } else {
+        fp_decode(value.abs(), round, max_digits)
+    };
+    // `-0.0` is not below zero, so it prints without a sign, as in SQLite. With `#`
+    // and without `+`, a `%f` value that rounds to zero drops its minus sign.
+    let neg = value < 0.0 && !(spec.alt && !spec.plus && ty == b'f' && point <= round);
+
+    let mut exp_form = matches!(ty, b'e' | b'E');
+    let strip_zeros = if general {
+        precision -= 1;
+        let exp = point - 1;
+        if exp < -4 || exp > precision {
+            exp_form = true;
+        } else {
+            precision -= exp;
         }
-        // b'g' | b'G'
-        _ => format_general(mag, spec, ty == b'G'),
+        !spec.alt
+    } else {
+        spec.alt2
+    };
+    let has_point = precision > 0 || spec.alt || spec.alt2;
+    let mut e2 = if exp_form { 0 } else { point - 1 };
+
+    let mut body = String::new();
+    // The significant digits in order, then zeros once they run out.
+    let mut used = 0;
+    let mut next_digit = || {
+        let d = digits.get(used).copied().unwrap_or(b'0');
+        used += 1;
+        d as char
+    };
+    if e2 < 0 {
+        body.push('0');
+    } else {
+        while e2 >= 0 {
+            body.push(next_digit());
+            if spec.comma && e2 % 3 == 0 && e2 > 1 {
+                body.push(',');
+            }
+            e2 -= 1;
+        }
+    }
+    if has_point {
+        body.push('.');
+    }
+    // Zeros between the point and the first significant digit.
+    e2 += 1;
+    while e2 < 0 && precision > 0 {
+        body.push('0');
+        precision -= 1;
+        e2 += 1;
+    }
+    for _ in 0..precision {
+        body.push(next_digit());
+    }
+    if strip_zeros && has_point {
+        body.truncate(body.trim_end_matches('0').len());
+        if body.ends_with('.') {
+            if spec.alt2 {
+                body.push('0');
+            } else {
+                body.pop();
+            }
+        }
+    }
+    if exp_form {
+        let exp = point - 1;
+        body.push(if ty.is_ascii_uppercase() { 'E' } else { 'e' });
+        body.push(if exp < 0 { '-' } else { '+' });
+        body.push_str(&format!("{:02}", exp.unsigned_abs()));
+    }
+
+    push_padded_numeric(out, spec, sign_str(neg, spec), &body, spec.zero);
+}
+
+/// Decimal digits of a finite `r >= 0`, a port of SQLite's `sqlite3FpDecode` (the
+/// double-double path it takes when `long double` is no wider than `double`).
+/// Returns the significant digits, without trailing zeros, and the position of the
+/// decimal point: the value is `0.DIGITS * 10^point`.
+///
+/// `round > 0` rounds to that many significant digits; `round <= 0` rounds to
+/// `-round` digits after the decimal point. Either way at most `max_digits`
+/// significant digits are kept. Rounding is half away from zero on the decimal
+/// digits, so `0.5` rounded to an integer is `1` and `0.125` to two places `0.13`.
+// The constants are copied from SQLite as written, digits beyond f64 included.
+#[allow(clippy::excessive_precision)]
+fn fp_decode(r: f64, mut round: i32, max_digits: i32) -> (Vec<u8>, i32) {
+    if r == 0.0 {
+        return (vec![b'0'], 1);
+    }
+    // Scale r by powers of ten into [~9.2e17, ~9.2e18] in double-double arithmetic,
+    // then read off the integer: about 19 significant digits. The second constant
+    // of each pair is the error of the first.
+    let mut rr = [r, 0.0];
+    let mut exp = 0;
+    if rr[0] > 9.223372036854774784e+18 {
+        while rr[0] > 9.223372036854774784e+118 {
+            exp += 100;
+            dekker_mul2(&mut rr, 1.0e-100, -1.99918998026028836196e-117);
+        }
+        while rr[0] > 9.223372036854774784e+28 {
+            exp += 10;
+            dekker_mul2(&mut rr, 1.0e-10, -3.6432197315497741579e-27);
+        }
+        while rr[0] > 9.223372036854774784e+18 {
+            exp += 1;
+            dekker_mul2(&mut rr, 1.0e-01, -5.5511151231257827021e-18);
+        }
+    } else {
+        while rr[0] < 9.223372036854774784e-83 {
+            exp -= 100;
+            dekker_mul2(&mut rr, 1.0e+100, -1.5902891109759918046e+83);
+        }
+        while rr[0] < 9.223372036854774784e+07 {
+            exp -= 10;
+            dekker_mul2(&mut rr, 1.0e+10, 0.0);
+        }
+        while rr[0] < 9.22337203685477478e+17 {
+            exp -= 1;
+            dekker_mul2(&mut rr, 1.0e+01, 0.0);
+        }
+    }
+    let v = if rr[1] < 0.0 {
+        (rr[0] as u64).wrapping_sub((-rr[1]) as u64)
+    } else {
+        (rr[0] as u64).wrapping_add(rr[1] as u64)
     };
 
-    let sign = sign_str(neg && !suppress_sign, spec);
-    push_padded_numeric(out, spec, sign, &body, spec.zero);
-}
-
-/// Float precision: the requested value clamped to a safe upper bound, or `default`
-/// when absent.
-fn float_prec(spec: &Spec, default: usize) -> usize {
-    match spec.precision {
-        None => default,
-        Some(p) => p.min(SAFE_FIELD as usize),
-    }
-}
-
-fn all_zero_digits(s: &str) -> bool {
-    s.bytes().all(|b| !b.is_ascii_digit() || b == b'0')
-}
-
-/// Apply the float alternate forms to a number body (the mantissa for `%e`/`%g`, the
-/// whole value for `%f`): `force_point` (`#` or `!`) inserts a decimal point when one
-/// is absent, and `min_frac` (`!`) then guarantees at least one digit after it.
-fn apply_float_altforms(s: &mut String, force_point: bool, min_frac: bool) {
-    if force_point && !s.contains('.') {
-        s.push('.');
-    }
-    // `!` guarantees a digit after the point: a number body has at most one '.', so a
-    // trailing '.' (the only way to have no fractional digit) gets a '0'.
-    if min_frac && s.ends_with('.') {
-        s.push('0');
-    }
-}
-
-/// Append a C/SQLite-style exponent suffix (`e±dd`, at least two exponent digits, the
-/// sign always present) to a mantissa already built in `s`.
-fn push_exponent(s: &mut String, exp_num: i32, upper: bool) {
-    s.push(if upper { 'E' } else { 'e' });
-    s.push(if exp_num < 0 { '-' } else { '+' });
-    s.push_str(&format!("{:02}", exp_num.unsigned_abs()));
-}
-
-/// Split Rust's `{:e}` output (`<mant>e<exp>`) into its mantissa and integer exponent.
-/// Only ever called on the formatter's own finite-float output, so the shape is
-/// guaranteed and the `expect`s are invariants, not failure points.
-fn split_sci(s: &str) -> (&str, i32) {
-    let (mant, exp) = s.split_once('e').expect("{:e} contains 'e'");
-    (mant, exp.parse().expect("{:e} exponent is an integer"))
-}
-
-/// `%e`/`%E`: `d.dddde±dd` with a signed, >=2-digit exponent (C/SQLite style, which
-/// Rust's `{:e}` does not produce).
-fn format_exp(mag: f64, prec: usize, upper: bool, force_point: bool, min_frac: bool) -> String {
-    let s = format!("{:.*e}", prec, mag);
-    let (mant, exp_num) = split_sci(&s);
-    let mut mantissa = mant.to_string();
-    apply_float_altforms(&mut mantissa, force_point, min_frac);
-    push_exponent(&mut mantissa, exp_num, upper);
-    mantissa
-}
-
-/// `%g`/`%G`: choose fixed or exponential per the C rule (fixed when the exponent is
-/// in `-4..P`), then strip trailing zeros unless the `#` flag keeps them. The `!`
-/// flag strips like the plain form but then forces a point and one fractional digit.
-fn format_general(mag: f64, spec: &Spec, upper: bool) -> String {
-    let p_req = spec.precision.unwrap_or(6);
-    // Precision 0 is treated as 1; clamp for allocation safety. The parens make the
-    // `.min()` apply to the whole `if` (both arms are already <= the cap, so this is
-    // clarity, not a behavior change).
-    let p = (if p_req == 0 { 1 } else { p_req }).min(SAFE_FIELD as usize);
-    let es = format!("{:.*e}", p - 1, mag);
-    let (mant, exp_num) = split_sci(&es);
-
-    // `#` keeps trailing zeros; the plain and `!` forms strip them.
-    let strip = !spec.alt;
-    let force_point = spec.alt || spec.alt2;
-    let min_frac = spec.alt2;
-
-    if exp_num < -4 || exp_num >= p as i32 {
-        let mut mantissa = mant.to_string();
-        if strip {
-            mantissa = strip_trailing_zeros(&mantissa).to_string();
+    let mut z = v.to_string().into_bytes();
+    let mut point = z.len() as i32 + exp;
+    if round <= 0 {
+        round = point - round;
+        // Rounding at the first digit: a leading 0 gives the carry somewhere to go.
+        if round == 0 && z[0] >= b'5' {
+            round = 1;
+            z.insert(0, b'0');
+            point += 1;
         }
-        apply_float_altforms(&mut mantissa, force_point, min_frac);
-        push_exponent(&mut mantissa, exp_num, upper);
-        mantissa
-    } else {
-        let fprec = (p as i32 - 1 - exp_num).max(0) as usize;
-        let mut body = format!("{:.*}", fprec, mag);
-        if strip {
-            body = strip_trailing_zeros(&body).to_string();
+    }
+    let mut n = z.len();
+    if round > 0 && ((round as usize) < n || n > max_digits as usize) {
+        n = round.min(max_digits) as usize;
+        if z[n] >= b'5' {
+            let mut j = n - 1;
+            loop {
+                if z[j] < b'9' {
+                    z[j] += 1;
+                    break;
+                }
+                z[j] = b'0';
+                if j == 0 {
+                    z.insert(0, b'1');
+                    n += 1;
+                    point += 1;
+                    break;
+                }
+                j -= 1;
+            }
         }
-        apply_float_altforms(&mut body, force_point, min_frac);
-        body
     }
+    z.truncate(n);
+    while z.len() > 1 && z.last() == Some(&b'0') {
+        z.pop();
+    }
+    (z, point)
 }
 
-/// Strip trailing fractional zeros (and a now-bare decimal point) from a number that
-/// has no exponent suffix.
-fn strip_trailing_zeros(s: &str) -> &str {
-    if s.contains('.') {
-        s.trim_end_matches('0').trim_end_matches('.')
-    } else {
-        s
-    }
-}
-
-/// Insert thousands separators into the integer part of a formatted float.
-fn comma_float(body: &str) -> String {
-    match body.split_once('.') {
-        Some((int_part, frac)) => format!("{}.{}", group_commas(int_part), frac),
-        None => group_commas(body),
-    }
+/// Dekker's double-double product `x *= (y + yy)`, as in SQLite's `dekkerMul2`.
+fn dekker_mul2(x: &mut [f64; 2], y: f64, yy: f64) {
+    const HI: u64 = 0xffff_ffff_fc00_0000;
+    let hx = f64::from_bits(x[0].to_bits() & HI);
+    let tx = x[0] - hx;
+    let hy = f64::from_bits(y.to_bits() & HI);
+    let ty = y - hy;
+    let p = hx * hy;
+    let q = hx * ty + tx * hy;
+    let c = p + q;
+    let mut cc = p - c + q + tx * ty;
+    cc += x[0] * yy + x[1] * y;
+    x[0] = c + cc;
+    x[1] = c - x[0];
+    x[1] += cc;
 }
 
 // ---------------------------------------------------------------------------
@@ -764,6 +813,12 @@ mod tests {
         assert_eq!(f("%f", &[r(3.5)]), "3.500000");
         assert_eq!(f("%.2f", &[r(3.14159)]), "3.14");
         assert_eq!(f("%.0f", &[r(3.7)]), "4");
+        // SQLite rounds half away from zero and keeps 16 significant digits.
+        assert_eq!(f("%.0f", &[r(0.5)]), "1");
+        assert_eq!(f("%.0f", &[r(-2.5)]), "-3");
+        assert_eq!(f("%.2f", &[r(0.125)]), "0.13");
+        assert_eq!(f("%.20f", &[r(0.1)]), "0.10000000000000000000");
+        assert_eq!(f("%!.30f", &[r(0.1)]), "0.1000000000000000055");
         assert_eq!(f("%8.2f", &[r(3.14159)]), "    3.14");
         assert_eq!(f("%-8.2f", &[r(3.14159)]), "3.14    ");
         assert_eq!(f("%08.2f", &[r(3.14159)]), "00003.14");
@@ -796,8 +851,10 @@ mod tests {
     fn float_non_finite() {
         assert_eq!(f("%f", &[r(f64::INFINITY)]), "Inf");
         assert_eq!(f("%f", &[r(f64::NEG_INFINITY)]), "-Inf");
-        // The 0 flag switches to SQL/JSON literals.
-        assert_eq!(f("%05f", &[r(f64::INFINITY)]), "9.0e+999");
+        // With the 0 flag, Inf prints as 9e999 in the requested form, as in SQLite.
+        assert_eq!(f("%05e", &[r(f64::INFINITY)]), "9.000000e+999");
+        assert_eq!(f("%05f", &[r(f64::NEG_INFINITY)]), format!("-9{}.000000", "0".repeat(999)));
+        assert_eq!(f("%0f", &[r(f64::NAN)]), "null");
     }
 
     #[test]
@@ -846,9 +903,11 @@ mod tests {
         assert_eq!(f("%!g", &[r(3.0)]), "3.0");
         assert_eq!(f("%!.0f", &[r(3.0)]), "3.0");
         assert_eq!(f("%!.0e", &[r(3.0)]), "3.0e+00");
-        // A value that already has fractional digits is unchanged by '!'.
+        // A value that already has fractional digits is unchanged by '!', and '!'
+        // drops trailing zeros from %f and %e, as SQLite does.
         assert_eq!(f("%!g", &[r(3.5)]), "3.5");
-        assert_eq!(f("%!f", &[r(3.5)]), "3.500000");
+        assert_eq!(f("%!f", &[r(3.5)]), "3.5");
+        assert_eq!(f("%!.4e", &[r(3.5)]), "3.5e+00");
         // '!' still strips %g trailing zeros (unlike '#'), then re-adds one.
         assert_eq!(f("%!g", &[r(2.0)]), "2.0");
     }
