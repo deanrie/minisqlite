@@ -327,17 +327,17 @@ mod tests {
     }
 
     #[test]
-    fn out_of_range_day_renders_raw_but_normalizes_under_a_modifier() {
-        // An in-range-but-impossible day is stored verbatim and the FIELD renders show it
-        // literally (SQLite: date ≡ strftime('%F'); the field codes read the stored day).
-        assert_eq!(text(&call(&DateFn, &[t("2020-09-31")])), "2020-09-31");
-        assert_eq!(text(&call(&DateTimeFn, &[t("2009-02-31")])), "2009-02-31 00:00:00");
-        assert_eq!(text(&call(&StrftimeFn, &[t("%Y-%m-%d"), t("2020-09-31")])), "2020-09-31");
-        assert_eq!(text(&call(&DateTimeFn, &[t("2009-02-31 12:34:56")])), "2009-02-31 12:34:56");
-        // Mixed strftime: the field code %d shows the stored day 31, while the Julian-day
-        // code %j uses the normalized instant (Feb 31 2009 -> Mar 3, day-of-year 62).
-        assert_eq!(text(&call(&StrftimeFn, &[t("%d/%j"), t("2009-02-31")])), "31/062");
-        assert_eq!(text(&call(&StrftimeFn, &[t("%d"), t("2009-02-31")])), "31");
+    fn out_of_range_day_rolls_over_without_a_modifier_and_under_one() {
+        // With no modifier sqlite recomputes a day past 28 from the Julian day, so a day
+        // that does not exist in its month rolls into the next (sqlite3 3.51.3).
+        assert_eq!(text(&call(&DateFn, &[t("2020-09-31")])), "2020-10-01");
+        assert_eq!(text(&call(&DateTimeFn, &[t("2009-02-31")])), "2009-03-03 00:00:00");
+        assert_eq!(text(&call(&StrftimeFn, &[t("%Y-%m-%d"), t("2020-09-31")])), "2020-10-01");
+        assert_eq!(text(&call(&DateTimeFn, &[t("2009-02-31 12:34:56")])), "2009-03-03 12:34:56");
+        assert_eq!(text(&call(&StrftimeFn, &[t("%d/%j"), t("2009-02-31")])), "03/062");
+        assert_eq!(text(&call(&StrftimeFn, &[t("%d"), t("2009-02-31")])), "03");
+        // `subsec` alone does not trigger that step, so the day stays as typed there.
+        assert_eq!(text(&call(&DateFn, &[t("2020-09-31"), t("subsec")])), "2020-09-31");
         // Any modifier (even a zero shift) forces the Julian day and normalizes -> Mar 3.
         assert_eq!(text(&call(&DateFn, &[t("2009-02-31"), t("+0 days")])), "2009-03-03");
         // A Julian-day output normalizes regardless of modifiers.
@@ -350,10 +350,11 @@ mod tests {
     #[test]
     fn hour_24_renders_literally_without_rolling_the_date() {
         // `%H` is 00-24: a literal hour 24 is preserved and does NOT roll the date on a
-        // field render — the same stored-field rule that keeps an out-of-range day
-        // literal. So both fields stay literal together.
+        // field render.
         assert_eq!(text(&call(&DateTimeFn, &[t("2009-02-28 24:00")])), "2009-02-28 24:00:00");
         assert_eq!(text(&call(&TimeFn, &[t("2009-02-28 24:00")])), "24:00:00");
+        // With hour 24 the day is not rolled over either (sqlite3 prints
+        // `2009-03-04 24:00:00` here; see `DateTime::normalize_unmodified_day`).
         assert_eq!(text(&call(&DateTimeFn, &[t("2009-02-31 24:00")])), "2009-02-31 24:00:00");
     }
 

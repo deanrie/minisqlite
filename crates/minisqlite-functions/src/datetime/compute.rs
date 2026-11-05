@@ -17,8 +17,8 @@ use super::value::DateTime;
 
 /// A computed value plus whether a `subsec`/`subsecond` modifier was seen (which
 /// raises the output resolution of `time`/`datetime`/`unixepoch`/`%s` to ms). The
-/// [`DateTime`] may still be un-normalized: with no modifier, an out-of-range ISO day
-/// and a literal hour 24 render verbatim, matching SQLite's deferred Julian-day compute.
+/// [`DateTime`] may still be un-normalized: without a transforming modifier a literal
+/// hour 24 renders verbatim, matching SQLite's deferred Julian-day compute.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Computed {
     pub(crate) dt: DateTime,
@@ -49,7 +49,11 @@ pub(crate) fn compute(args: &[Value], ctx: &mut dyn FnContext) -> Option<Compute
         }
         other => other,
     };
-    modifier::apply(tv, mod_args)
+    let mut computed = modifier::apply(tv, mod_args)?;
+    if mod_args.is_empty() {
+        computed.dt = computed.dt.normalize_unmodified_day();
+    }
+    Some(computed)
 }
 
 /// Resolve a single time-value with no modifiers, for `timediff`. A numeric value is

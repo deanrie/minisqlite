@@ -8,8 +8,9 @@ use super::compute::Computed;
 use super::julian::{Breakdown, Instant};
 
 /// `date(...)` -> `YYYY-MM-DD`. Field render from the civil fields, which are the raw
-/// parsed fields until a modifier or Julian-day output normalizes them (so an
-/// out-of-range day renders verbatim, e.g. `date('2020-09-31')` -> `'2020-09-31'`).
+/// parsed fields until a modifier or Julian-day output normalizes them (a day past 28
+/// is already rolled over when there is no modifier, see
+/// `DateTime::normalize_unmodified_day`).
 pub(crate) fn render_date(c: &Computed) -> Value {
     let b = c.dt.civil();
     Value::Text(format!("{:04}-{:02}-{:02}", b.year, b.month, b.day))

@@ -9,8 +9,7 @@ use super::julian::{day_of_year, iso_week, week_of_year_monday, week_of_year_sun
 /// unsupported substitution.
 ///
 /// Field codes (`%Y`/`%m`/`%d`/`%H`/`%M`/`%S`/`%F`/`%T`/`%R`/`%e`/`%k`/`%l`/`%f`/`%p`/
-/// `%P`) read the raw civil fields, so an un-normalized out-of-range day (and a literal
-/// hour 24) round-trip. Julian-day-derived codes (`%s`/`%J`/`%j`/`%w`/`%u`/`%U`/`%W`/
+/// `%P`) read the raw civil fields, so a literal hour 24 round-trips. Julian-day-derived codes (`%s`/`%J`/`%j`/`%w`/`%u`/`%U`/`%W`/
 /// `%V`/`%G`/`%g`) instead read the instant, which normalizes first — exactly as SQLite
 /// computes `%Y`/`%d` from the stored fields but `%s` from the (normalizing) Julian day.
 pub(crate) fn strftime(fmt: &str, c: &Computed) -> Option<String> {

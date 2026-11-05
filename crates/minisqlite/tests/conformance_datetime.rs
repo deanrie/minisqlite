@@ -41,6 +41,29 @@ fn date_from_date_only_input_is_unchanged() {
     eval_eq("date('2004-07-15')", text("2004-07-15"));
 }
 
+// A day that does not exist in its month. lang_datefunc.html does not say how one is
+// rendered, so these expectations come from sqlite3 3.51.3 rather than the spec: with
+// no modifier, a day past 28 is recomputed from the Julian day and rolls into the next
+// month, exactly as it does under any modifier.
+
+#[test]
+fn nonexistent_day_rolls_into_the_next_month_without_a_modifier() {
+    eval_eq("date('2023-02-29')", text("2023-03-01"));
+    eval_eq("date('2024-02-30')", text("2024-03-01"));
+    eval_eq("date('1900-02-29')", text("1900-03-01"));
+    eval_eq("date('2024-04-31')", text("2024-05-01"));
+    eval_eq("datetime('2024-02-31 10:00')", text("2024-03-02 10:00:00"));
+    eval_eq("datetime('2023-11-31 23:59:59.5')", text("2023-12-01 23:59:59"));
+    eval_eq("strftime('%Y-%m-%d', '2024-06-31')", text("2024-07-01"));
+    eval_eq("strftime('%d %m', '2023-09-31')", text("01 10"));
+    // The result is the same as with a modifier that changes nothing.
+    eval_eq("date('2023-02-29') = date('2023-02-29', '+0 days')", int(1));
+    // Real dates, including 2000-02-29 and 2024-02-29, are unchanged.
+    eval_eq("date('2000-02-29')", text("2000-02-29"));
+    eval_eq("date('2024-02-29')", text("2024-02-29"));
+    eval_eq("date('2024-01-31')", text("2024-01-31"));
+}
+
 // ---------------------------------------------------------------------------
 // time() — returns "HH:MM:SS" (§1, "The time() function returns the time as
 // text ... HH:MM:SS ...").

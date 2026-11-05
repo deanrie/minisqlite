@@ -96,10 +96,12 @@ pub(crate) enum Mod {
 ///
 /// A `subsec` modifier only raises the output resolution; every *other* modifier
 /// transforms the value via SQLite's Julian-day compute. With no transforming modifier
-/// the base is passed through in raw field form, so an out-of-range day and a literal
-/// hour-24 both render verbatim (`date('2020-09-31')` -> `'2020-09-31'`,
-/// `datetime('2009-02-28 24:00')` -> `'2009-02-28 24:00:00'`); a single transform (even
-/// `'+0 days'`) computes the instant, normalizing both (-> `'2020-10-01'`).
+/// the base is passed through in raw field form, so a literal hour-24 renders verbatim
+/// (`datetime('2009-02-28 24:00')` -> `'2009-02-28 24:00:00'`), and so does an
+/// out-of-range day under `subsec` alone (`date('2020-09-31', 'subsec')` ->
+/// `'2020-09-31'`; with no modifier at all `compute` rolls the day over instead); a
+/// single transform (even `'+0 days'`) computes the instant, normalizing both
+/// (-> `'2020-10-01'`).
 pub(crate) fn apply(tv: TimeValue, mod_args: &[Value]) -> Option<Computed> {
     // Pre-parse every modifier; a NULL argument or an invalid modifier is NULL.
     let mut mods: Vec<Mod> = Vec::with_capacity(mod_args.len());
